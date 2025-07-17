@@ -2,7 +2,6 @@ use std::path::Path;
 
 mod version_fetcher;
 mod original_dwl;
-mod decompression;
 
 /// original_dwl 下载任务
 pub async fn original_download_task(

@@ -16,14 +16,14 @@ use anyhow::{anyhow, Result};
 
 const MOJANG_MANIFEST: &str = "https://piston-meta.mojang.com/mc/game/version_manifest.json";
 const MIRROR_URL: &str = "https://bmclapi2.bangbang93.com";
-const MAX_CONCURRENT_DOWNLOADS: usize = 64 ;
+const MAX_CONCURRENT_DOWNLOADS: usize = 16 ;
 
 #[derive(Debug)]
 struct DownloadTask {
     urls: Vec<String>,
     target_path: PathBuf,
     sha1: String,
-    size: u64,  
+    size: u64,
 }
 
 struct DownloadProgress {
@@ -183,10 +183,9 @@ async fn download_task(
 
         let current_url = task.urls.iter()
             .find(|url| !used_urls.contains(url))
-            .or_else(|| task.urls.first());
+            .or_else(|| task.urls.first());;
         let (result, url_used) = match current_url {
             Some(url) => {
-                println!("Downloading from: {}", url);
                 used_urls.push(url.to_string());
                 (download_with_url(url, &task).await, url.to_string())
             }
@@ -223,7 +222,7 @@ async fn download_task(
         tokio::time::sleep(Duration::from_secs(2)).await; // 增加重试间隔
     }
 
-Err(format!("文件 {} 下载失败，已尝试所有源", task.target_path.display()).into())
+    Err(format!("文件 {} 下载失败，已尝试所有源", task.target_path.display()).into())
 }
 
 
@@ -245,7 +244,7 @@ async fn download_with_url(
 
     // 优化点：使用完整字节缓冲代替流式写入
     let bytes = response.bytes().await?;
-    
+
     // 原子性写入：先写入临时文件，验证后重命名
     let temp_path = task.target_path.with_extension("download");
     {
@@ -262,7 +261,7 @@ async fn download_with_url(
 
     // 原子性重命名
     tokio::fs::rename(&temp_path, &task.target_path).await?;
-    
+
     Ok(())
 }
 
@@ -314,12 +313,12 @@ pub async fn process_version(
     let json_content = reqwest::get(&json_url).await?.text().await?;
     fs::write(version_dir.join(format!("{}.json", version)), &json_content)?;
     let version_data: VersionJson = serde_json::from_str(&json_content)?;
-     let assets_content = reqwest::get(&version_data.asset_index.url).await?.text().await?;
-    
+    let assets_content = reqwest::get(&version_data.asset_index.url).await?.text().await?;
+
     // 创建assets/indexes目录
     let indexes_dir = minecraft_path.join("assets").join("indexes");
     fs::create_dir_all(&indexes_dir)?;
-    
+
     // 保存索引文件（使用asset_index.id作为文件名）
     let index_path = indexes_dir.join(format!("{}.json", version_data.asset_index.id));
     fs::write(index_path, &assets_content)?;
@@ -328,7 +327,7 @@ pub async fn process_version(
 
 
     let mut tasks = Vec::new();
-
+    let mut native_jars = Vec::new();
     // 处理客户端JAR
     let client_download = &version_data.downloads.client;
     tasks.push(DownloadTask {
@@ -360,14 +359,22 @@ pub async fn process_version(
     } else {
         "linux"
     };
-
+    let candidates = match os_type {
+        "windows" => vec!["natives-windows", "natives-windows-64"],
+        "osx" => vec!["natives-osx"],
+        "linux" => vec!["natives-linux"],
+        _ => vec![]
+    };
     for lib in version_data.libraries {
         if !check_rules(&lib.rules, os_type) {
+            println!("跳过依赖库: {}", lib.name);
             continue;
         }
 
         // 处理主库文件
+
         if let Some(artifact) = lib.downloads.artifact {
+            let is_native_artifact = artifact.path.contains("-natives-") ;
             let mirror_path = artifact.path.replace(
                 "https://libraries.minecraft.net/",
                 "https://bmclapi2.bangbang93.com/maven/"
@@ -375,35 +382,37 @@ pub async fn process_version(
             let original_url = format!("{}/{}", base_url, artifact.path); // 新增
             let mirror_url = format!("https://bmclapi2.bangbang93.com/maven/{}", artifact.path);
             let target_path = minecraft_path.join("libraries").join(&artifact.path);
-            
             tasks.push(DownloadTask {
                 urls: vec![original_url, mirror_url],
-                target_path,
+                target_path: target_path.clone(),
                 sha1: artifact.sha1,
                 size: artifact.size,
             });
+            if is_native_artifact {
+                native_jars.push(target_path);
+            }
         }
 
         // 处理平台特定库
-        if let Some(classifier_template) = lib.natives.get(os_type) {
-    let classifier = format!("{}{}", classifier_template, current_arch_suffix());
-    if let Some(native) = lib.downloads.classifiers.get(&classifier) {
-        // 修正URL拼接方式
-        println!("下载平台特定库: {}", native.path);
-        let original_url = format!("{}/{}", base_url, native.path);
-        let mirror_url = format!("https://bmclapi2.bangbang93.com/maven/{}", native.path);
-        let target_path = minecraft_path.join("libraries").join(&native.path);
-        
-        if match_arch_suffix(&native.path) {
-            tasks.push(DownloadTask {
-                urls: vec![original_url, mirror_url], // 使用正确拼接的完整URL
-                target_path,
-                sha1: native.sha1.clone(),
-                size: native.size,
-            });
+        for classifier_key in &candidates {
+            if let Some(native) = lib.downloads.classifiers.get(*classifier_key) {
+                // 打印下载信息
+                println!("正在下载 {} 的 native 库: {}", os_type, classifier_key);
+                // 修正URL拼接方式
+                let original_url = format!("{}/{}", base_url, native.path);
+                let mirror_url = format!("https://bmclapi2.bangbang93.com/maven/{}", native.path);
+                let target_path = minecraft_path.join("libraries").join(&native.path);
+                native_jars.push(target_path.clone());
+                if match_arch_suffix(&native.path) {
+                    tasks.push(DownloadTask {
+                        urls: vec![original_url, mirror_url], // 使用正确拼接的完整URL
+                        target_path,
+                        sha1: native.sha1.clone(),
+                        size: native.size,
+                    });
+                }
+            }
         }
-    }
-}
     }
 
     // 处理资源文件
@@ -414,7 +423,7 @@ pub async fn process_version(
         let prefix = &obj.hash[0..2];
         let original_url = format!("https://resources.download.minecraft.net/{}/{}", prefix, obj.hash);
         let mirror_url = format!("{}/assets/{}/{}", MIRROR_URL, prefix, obj.hash);
-        
+
         tasks.push(DownloadTask {
             urls: vec![original_url, mirror_url],
             target_path: minecraft_path
@@ -446,6 +455,18 @@ pub async fn process_version(
     for result in results {
         result?;
     }
+    let os_extension = match os_type {
+        "windows" => ".dll",
+        "osx" => ".dylib",
+        "linux" => ".so",
+        _ => return Ok(vec![]),
+    };
+
+    for jar_path in native_jars {
+        if let Err(e) = process_native_file(&jar_path, os_extension, &natives_dir).await {
+            eprintln!("Error processing {}: {}", jar_path.display(), e);
+        }
+    }
 
     println!(
         "下载完成: 成功 {} 失败 {}",
@@ -455,11 +476,73 @@ pub async fn process_version(
 
     Ok(vec![])
 }
+async fn process_native_file(
+    jar_path: &Path,
+    target_extension: &str,
+    natives_dir: &Path,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let jar_path = jar_path.to_path_buf();
+    let natives_dir = natives_dir.to_path_buf();
+    let target_extension = target_extension.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(jar_path)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+
+        for i in 0..archive.len() {
+            let mut file = match archive.by_index(i) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("读取压缩文件条目失败: {}", e);
+                    continue;
+                }
+            };
+
+            // 跳过目录和非常规文件
+            if file.is_dir() || !file.is_file() {
+                continue;
+            }
+
+            let file_name = file.name().to_string();
+
+            // 获取纯文件名（去掉路径部分）
+            let pure_name = Path::new(&file_name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            // 匹配条件：特定扩展名 或 Tracy_LICENSE
+            let should_extract = pure_name.ends_with(target_extension.as_str())
+                || pure_name == "Tracy_LICENSE";
+
+            if should_extract {
+                // 创建扁平化路径（直接放在natives目录）
+                let dest_path = natives_dir.join(pure_name);
+
+                // 创建父目录（根目录已存在）
+                if let Some(parent) = dest_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                // 写入文件
+                let mut dest_file = std::fs::File::create(&dest_path)?;
+                std::io::copy(&mut file, &mut dest_file)?;
+
+                println!("解压文件: {} -> {}", pure_name, dest_path.display());
+            }
+        }
+
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    }).await??;
+
+    Ok(())
+}
 
 fn check_rules(rules: &[Rule], os_type: &str) -> bool {
     let mut allowed = true;
     for rule in rules {
-        let os_match = rule.os.as_ref().map_or(true, |os| 
+        println!("规则: {}", rule.action);
+        let os_match = rule.os.as_ref().map_or(true, |os|
             os.name.as_deref() == Some(os_type)
         );
         match rule.action.as_str() {
@@ -474,6 +557,7 @@ fn check_rules(rules: &[Rule], os_type: &str) -> bool {
 fn current_arch_suffix() -> &'static str {
     match env::consts::ARCH {
         "x86_64" => "",
+        "x86_64" => "-64",
         "aarch64" => "-arm64",
         "x86" => "-x86",
         "arm" => "-arm",
@@ -510,6 +594,7 @@ async fn fetch_version_url(version: &str) -> Result<String, Box<dyn Error + Send
         .map(Ok)
         .unwrap_or_else(|| Ok(format!("{}/{}/json", MIRROR_URL, version)))
 }
+
 
 pub async fn download(version: &str, mc_home: &Path) -> Result<()> {
     process_version(version, mc_home)

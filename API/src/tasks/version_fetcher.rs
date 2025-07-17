@@ -37,7 +37,7 @@ pub async fn classify_minecraft_versions() -> Result<[Vec<String>; 4], ReqwestEr
             old_versions.push(entry.id);
             continue;
         }
-        
+
         // 处理愚人节版本（次高优先级）
         if entry.time.contains("-04-01") {
             april_fools.push(entry.id);
