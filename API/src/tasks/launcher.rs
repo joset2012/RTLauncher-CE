@@ -99,6 +99,7 @@ pub struct LauncherConfig {
     pub wrapper_path: PathBuf,
     pub launcher_version: String,
     pub max_memory: String,
+    pub version_type: String,
 }
 
 pub fn build_jvm_arguments(
@@ -205,7 +206,7 @@ pub fn build_jvm_arguments(
          .replace("${assets_index_name}", 
              &version_json.asset_index.as_ref().map(|a| &a.id).unwrap_or(&String::new()))
          .replace("${user_type}", "msa")
-         .replace("${version_type}", "RTL")
+         .replace("${version_type}", config.version_type.as_str())
     };
 
     // 处理库文件
