@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <title>RTAPI 任务面板</title>
+    <style>
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;padding:20px}
+        input,button{padding:4px 8px;font-family:inherit;font-size:14px}
+        table{border-collapse:collapse;margin-top:10px;width:100%}
+        th,td{border:1px solid #ddd;padding:6px;text-align:left;font-size:14px}
+        th{background:#f2f2f2}
+        #log div{margin:2px 0;white-space:pre-wrap;font-size:13px}
+    </style>
+</head>
+<body>
+
+<h2>提交下载任务</h2>
+<label>版本号：<input id="ver" placeholder="留空 = 默认"/></label>
+<button id="start">提交下载</button>
+<button id="refresh">刷新任务列表</button>
+
+<h2>任务列表</h2>
+<table id="tbl">
+    <thead><tr><th>UUID</th><th>状态</th><th>信息</th><th>操作</th></tr></thead>
+    <tbody></tbody>
+</table>
+
+<h2>日志</h2>
+<pre id="log"></pre>
+
+<script>
+    const $ = s=>document.querySelector(s);
+    const log = m=>{
+        console.log(m);
+        const d=document.createElement('div');d.textContent=m;
+        $('#log').appendChild(d);
+    };
+
+    function addWS(id){
+        const ws=new WebSocket(`ws://${location.host}/ws/${id}`);
+        ws.onopen =()=>log(`[${id}] WS connected`);
+        ws.onmessage=e=>log(`[${id}] ${e.data}`);
+        ws.onerror =e=>log(`[${id}] WS error: ${e.message||e}`);
+    }
+
+    $('#start').onclick=()=>{
+        const payload={module:'original_download'};
+        const v=$('#ver').value.trim(); if(v) payload.version=v;
+        fetch('/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+            .then(r=>r.json()).then(({id})=>{
+            log(`提交成功, 任务ID: ${id}`);
+            addWS(id);
+            refreshTasks();
+        }).catch(e=>log('提交失败: '+e));
+    };
+
+    function refreshTasks(){
+        fetch('/tasks').then(r=>r.json()).then(arr=>{
+            const tbody=$('#tbl tbody');
+            tbody.innerHTML='';
+            arr.forEach(({id,state,info})=>{
+                const tr=document.createElement('tr');
+                tr.innerHTML=`<td>${id}</td><td>${state}</td><td>${info}</td>
+        <td><button data-id="${id}" ${state==='running'||state==='queued'?'':'disabled'}>
+          取消
+        </button></td>`;
+                tbody.appendChild(tr);
+            });
+        });
+    }
+    $('#refresh').onclick=refreshTasks;
+
+    $('#tbl').addEventListener('click',e=>{
+        if(e.target.tagName==='BUTTON'){
+            const id=e.target.dataset.id;
+            fetch('/interrupt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})
+                .then(()=>{log(`已请求取消 ${id}`);refreshTasks();});
+        }
+    });
+
+    refreshTasks();
+</script>
+</body>
+</html>
