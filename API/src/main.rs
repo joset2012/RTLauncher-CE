@@ -20,12 +20,18 @@ use std::{
 };
 use tokio::{sync::Mutex, task};
 use uuid::Uuid;
-use futures::future::{BoxFuture, FutureExt};
-
+use futures::future::{FutureExt};
+use std::path::PathBuf;
 mod tasks;
 use tasks::*;
+use std::pin::Pin;
+use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-// 状态表&共享类型
+
+static WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+// 状态表和共享类型
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -37,13 +43,17 @@ enum TaskState {
     Canceled,
 }
 
-static TASK_STATUS: Lazy<Mutex<HashMap<Uuid, (TaskState, String)>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+type BoxedTask = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
 
-type Cancelled = Arc<Mutex<HashSet<Uuid>>>;
-type Running   = Arc<Mutex<HashMap<Uuid, AbortHandle>>>;
+// 状态表
+static TASK_STATUS: Lazy<
+    Mutex<HashMap<Uuid, (TaskState, String /*module*/, String /*info*/ )>>,
+> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+// 运行中句柄
+type Running = Arc<Mutex<HashMap<Uuid, AbortHandle>>>;
 type Sessions = Arc<Mutex<HashMap<Uuid, Addr<WebSocketSession>>>>;
+type Cancelled = Arc<Mutex<HashSet<Uuid>>>;
 
 // websocket
 
@@ -80,9 +90,19 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
 
 #[derive(Clone)]
 struct Job {
-    id: Uuid,
-    module: String,
+    id:      Uuid,
+    module:  String,
     version: Option<String>,
+
+    minecraft_path:   Option<String>,
+    java_path:        Option<String>,
+    wrapper_path:     Option<String>,
+    launcher_version: Option<String>,
+    max_memory:       Option<String>,
+    version_type:     Option<String>,
+    player: Option<String>,
+    token:  Option<String>,
+    uuid:   Option<String>,
 }
 #[derive(Default)]
 struct QueueState {
@@ -98,6 +118,22 @@ struct SubmitRequest {
     module: String,
     version: Option<String>,
 }
+#[derive(Deserialize)]
+struct SubmitPayload {
+    module: String,
+    version: Option<String>,
+
+    minecraft_path:   Option<String>,
+    java_path:        Option<String>,
+    wrapper_path:     Option<String>,
+    launcher_version: Option<String>,
+    max_memory:       Option<String>,
+    version_type:     Option<String>,
+    player: Option<String>,
+    token:  Option<String>,
+    uuid:   Option<String>,
+}
+
 #[derive(Serialize)]
 struct SubmitResp {
     id: Uuid,
@@ -117,21 +153,37 @@ struct InterruptReq {
 #[post("/submit")]
 async fn submit(
     queue:     Data<Queue>,
-    sessions:  Data<Sessions>,
     running:   Data<Running>,
     cancelled: Data<Cancelled>,
-    Json(req): Json<SubmitRequest>,
+    sessions:  Data<Sessions>,
+    Json(req): Json<SubmitPayload>,
 ) -> impl Responder {
     let id = Uuid::new_v4();
-    TASK_STATUS.lock().await.insert(id, (TaskState::Queued, "".into()));
 
-    queue.lock().await.queue.push_back(Job{
-        id, module:req.module, version:req.version,
+    // Queued
+    TASK_STATUS
+        .lock()
+        .await
+        .insert(id, (TaskState::Queued, req.module.clone(), "".into()));
+
+    // 构造入队
+    queue.lock().await.queue.push_back(Job {
+        id,
+        module:  req.module.clone(),
+        version: req.version,
+        minecraft_path:   req.minecraft_path,
+        java_path:        req.java_path,
+        wrapper_path:     req.wrapper_path,
+        launcher_version: req.launcher_version,
+        max_memory:       req.max_memory,
+        version_type:     req.version_type,
+        player: req.player,
+        token:  req.token,
+        uuid:   req.uuid,
     });
 
-    // 如果当前没有 worker，再启动一个
-    if !queue.lock().await.running {
-        queue.lock().await.running = true;
+    // 若当前没有活跃worker则启动一个
+    if WORKERS.fetch_add(1, Ordering::SeqCst) == 0 {
         spawn_worker(
             queue.clone(),
             sessions.clone(),
@@ -142,6 +194,9 @@ async fn submit(
 
     HttpResponse::Ok().json(SubmitResp { id })
 }
+
+
+
 
 #[get("/ws/{id}")]
 async fn ws_index(
@@ -169,29 +224,42 @@ async fn interrupt(
     running: Data<Running>,
     cancelled: Data<Cancelled>,
 ) -> impl Responder {
-    // 执行中
-    if let Some(h) = running.lock().await.remove(&req.id) {
-        h.abort();
-        TASK_STATUS.lock().await.insert(req.id, (TaskState::Canceled, "killed running".into()));
-        return HttpResponse::Ok().body("running task aborted");
+    // abort
+    if let Some(ab) = running.lock().await.remove(&req.id) {
+        ab.abort();
+        TASK_STATUS.lock().await.insert(
+            req.id,
+            (TaskState::Canceled, "running".into(), "aborted".into()),
+        );
+        return HttpResponse::Ok().body("running task canceled");
     }
-    // 排队中
+
+    // 标记取消
     cancelled.lock().await.insert(req.id);
-    TASK_STATUS.lock().await.insert(req.id, (TaskState::Canceled, "canceled before run".into()));
+    TASK_STATUS.lock().await.insert(
+        req.id,
+        (TaskState::Canceled, "queued".into(), "canceled before run".into()),
+    );
     HttpResponse::Ok().body("queued task canceled")
 }
+
+
 
 #[get("/tasks")]
 async fn list_tasks() -> impl Responder {
     let map = TASK_STATUS.lock().await;
-    let list: Vec<_> = map.iter()
-        .map(|(id, (state, info))| json!({ "id": id, "state": state, "info": info }))
+    let list: Vec<_> = map
+        .iter()
+        .map(|(id, (state, module, info))| json!({
+            "id": id,
+            "module": module,
+            "state": state,
+            "info": info
+        }))
         .collect();
     HttpResponse::Ok().json(list)
 }
-
 // worker
-
 
 fn spawn_worker(
     queue: Data<Queue>,
@@ -201,86 +269,103 @@ fn spawn_worker(
 ) {
     task::spawn(async move {
         loop {
-            // 取队首任务
-            let job = { queue.lock().await.queue.pop_front() };
-            let job = match job {
+            // 取队首，若为空则线程退出
+            let job = match { queue.lock().await.queue.pop_front() } {
                 Some(j) => j,
-                None => {
-                    queue.lock().await.running = false;
-                    break;
-                }
+                None => break,
             };
 
-            // 如果已取消则跳过
+            // 排队阶段被取消
             if cancelled.lock().await.remove(&job.id) {
                 TASK_STATUS.lock().await.insert(
                     job.id,
-                    (TaskState::Canceled, "canceled in queue".into()),
+                    (TaskState::Canceled, job.module.clone(), "canceled in queue".into()),
                 );
                 continue;
             }
 
-            TASK_STATUS.lock().await.insert(job.id, (TaskState::Running, "".into()));
+            TASK_STATUS.lock().await.insert(
+                job.id,
+                (TaskState::Running, job.module.clone(), "".into()),
+            );
 
-            // 拆解 job 获取所有权
-            let Job { id: task_id, module, version } = job;
+            let task_id     = job.id;
+            let module_name = job.module.clone();
 
-            // 构造任务 Future
-            let fut: BoxFuture<'static, anyhow::Result<String>> = match module.as_str() {
-                "classify_versions" => {
-                    async { classify_versions_task().await }.boxed()
-                }
-                "original_download" => {
-                    let mc_home = std::path::Path::new(
-                        r"C:\Users\smh20\Documents\Rust\RTAPI\.minecraft",
-                    );
-                    let ver = version.as_deref().unwrap_or("1.20.4").to_owned();
-                    async move { original_download_task(&ver, mc_home).await }.boxed()
-                }
-                other => {
-                    let msg = format!("Unknown module: {other}");
-                    async move { Ok(msg) }.boxed()
-                }
+            let fut = build_task(job);
+
+            // abortable句柄登记
+            let (ab, reg) = AbortHandle::new_pair();
+            running.lock().await.insert(task_id, ab);
+            let result = Abortable::new(fut, reg).await;
+
+            // 结果状态
+            let (state, info) = match result {
+                Ok(Ok(s))   => (TaskState::Completed, s),
+                Ok(Err(e))  => (TaskState::Failed, e.to_string()),
+                Err(Aborted)=> (TaskState::Canceled, "by interrupt".into()),
             };
-
-            // 包装为可中断任务
-            let (handle, reg) = AbortHandle::new_pair();
-            let abortable = Abortable::new(fut, reg);
-            running.lock().await.insert(task_id, handle);
-
-            // 执行任务
-            let text = match abortable.await {
-                Ok(Ok(s)) => {
-                    TASK_STATUS
-                        .lock()
-                        .await
-                        .insert(task_id, (TaskState::Completed, s.clone()));
-                    s
-                }
-                Ok(Err(e)) => {
-                    TASK_STATUS
-                        .lock()
-                        .await
-                        .insert(task_id, (TaskState::Failed, e.to_string()));
-                    format!("Task failed: {e}")
-                }
-                Err(Aborted) => {
-                    TASK_STATUS
-                        .lock()
-                        .await
-                        .insert(task_id, (TaskState::Canceled, "by interrupt".into()));
-                    "Task canceled".into()
-                }
-            };
+            TASK_STATUS
+                .lock()
+                .await
+                .insert(task_id, (state, module_name.clone(), info));
 
             running.lock().await.remove(&task_id);
 
-            // 推送消息
+            // 推送日志
             if let Some(addr) = sessions.lock().await.get(&task_id) {
-                addr.do_send(WsMessage(text));
+                addr.do_send(WsMessage(module_name + " done"));
             }
         }
+
+        // 线程结束，计数-1
+        WORKERS.fetch_sub(1, Ordering::SeqCst);
     });
+}
+
+/// 异步任务
+fn build_task(job: Job) -> BoxedTask {
+    match job.module.as_str() {
+        "classify_versions" => Box::pin(async { classify_versions_task().await }),
+
+        "original_download" => {
+            let ver     = job.version.unwrap_or_else(|| "1.20.4".into());
+            let mc_home = std::env::current_dir().unwrap().join(".minecraft");
+            Box::pin(async move { original_download_task(&ver, &mc_home).await })
+        }
+
+        "launch_game" => {
+            let cfg = tasks::launcher::LauncherConfig {
+                minecraft_path: PathBuf::from(
+                    job.minecraft_path.unwrap_or_else(|| "C:/Users/smh20/.minecraftx".into())),
+                java_path: PathBuf::from(
+                    job.java_path.unwrap_or_else(|| "C:/Program Files/Java/jdk-17/bin/java.exe".into())),
+                wrapper_path: PathBuf::from(
+                    job.wrapper_path.unwrap_or_else(|| "C:/Users/smh20/Documents/Rust/java_launch_wrapper-1.4.3.jar".into())),
+                launcher_version: job.launcher_version.unwrap_or_else(|| "1.0.0".into()),
+                max_memory: job.max_memory.unwrap_or_else(|| "16384".into()),
+                version_type: job.version_type.unwrap_or_else(|| "NULL11034".into()),
+            };
+            let ver  = job.version.unwrap_or_else(|| "1.19.2".into());
+            let name = job.player.unwrap_or_else(|| "Player".into());
+            let tok  = job.token.unwrap_or_else(|| "mc_token".into());
+            let uid  = job.uuid.unwrap_or_else(|| "uuid".into());
+
+            Box::pin(async move {
+                let args = tasks::launcher::build_jvm_arguments(&cfg, &ver, &name, &tok, &uid)?;
+                let status = tokio::process::Command::new(&cfg.java_path)
+                    .args(&args)
+                    .status()
+                    .await?;
+                Ok::<_, anyhow::Error>(format!("game exit: {status}"))
+            })
+        }
+
+        other => {
+            let msg = format!("Unknown module: {other}");
+            Box::pin(async move { Ok(msg) })
+        }
+    }
 }
 
 // main
@@ -291,14 +376,6 @@ async fn main() -> std::io::Result<()> {
     let queue: Queue = Arc::new(Mutex::new(QueueState::default()));
     let running: Running = Arc::new(Mutex::new(HashMap::new()));
     let cancelled: Cancelled = Arc::new(Mutex::new(HashSet::new()));
-
-    // worker启动
-    spawn_worker(
-        Data::new(queue.clone()),
-        Data::new(sessions.clone()),
-        Data::new(running.clone()),
-        Data::new(cancelled.clone()),
-    );
 
     HttpServer::new(move || {
         App::new()
@@ -320,7 +397,7 @@ async fn main() -> std::io::Result<()> {
             .service(feedback)
             .service(fs::Files::new("/", "./").index_file("index.html"))
     })
-        .bind(("0.0.0.0", 3000))?
+        .bind(("localhost", 3000))?
         .run()
         .await
 }
