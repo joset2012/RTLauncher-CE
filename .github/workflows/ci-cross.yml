@@ -1,103 +1,35 @@
-name: Platform Builds
+name: CI
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
-
-env:
-  CARGO_TERM_COLOR: always
+on: [push]
 
 jobs:
-  # === Linux ===
-  linux-x86_64:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup target add x86_64-unknown-linux-gnu
-      - run: cargo build --release --target x86_64-unknown-linux-gnu
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux-x86_64
-          path: target/x86_64-unknown-linux-gnu/release/
+    - name: Checkout
+      uses: actions/checkout@v2
 
-  # linux-i686:
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - run: cargo install cross
-  #     - run: cross build --release --target i686-unknown-linux-gnu
-  #     - uses: actions/upload-artifact@v4
-  #       with:
-  #         name: linux-i686
-  #         path: target/i686-unknown-linux-gnu/release/
+    - name: Build
+      run: |
+        echo "Building the project..."
+        # 编译代码
+        ./gradlew build
 
-  # linux-aarch64:
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - run: cargo install cross
-  #     - run: cross build --release --target aarch64-unknown-linux-gnu
-  #     - uses: actions/upload-artifact@v4
-  #       with:
-  #         name: linux-aarch64
-  #         path: target/aarch64-unknown-linux-gnu/release/
+    - name: Test
+      run: |
+        echo "Running tests..."
+        # 运行测试
+        ./gradlew test
 
-  # === Windows ===
-  windows-x86_64:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup target add x86_64-pc-windows-gnu
-      - run: cargo build --release --target x86_64-pc-windows-gnu
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-x86_64
-          path: target/x86_64-pc-windows-gnu/release/
+    - name: Publish
+      run: |
+        echo "Publishing the artifact..."
+        # 发布构建结果
+        ./gradlew publish
 
-  windows-i686:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: cargo install cross
-      - run: cross build --release --target i686-pc-windows-gnu
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-i686
-          path: target/i686-pc-windows-gnu/release/
 
-  # windows-aarch64:
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - run: cargo install cross
-  #     - run: rustup target add aarch64-pc-windows-msvc
-  #     - run: cross build --release --target aarch64-pc-windows-msvc
-  #     - uses: actions/upload-artifact@v4
-  #       with:
-  #         name: windows-aarch64
-  #         path: target/aarch64-pc-windows-gnu/release/
-
-  # === macOS ===
-  macos-x86_64:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup target add x86_64-apple-darwin
-      - run: cargo build --release --target x86_64-apple-darwin
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-x86_64
-          path: target/x86_64-apple-darwin/release/
-
-  macos-arm64:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup target add aarch64-apple-darwin
-      - run: cargo build --release --target aarch64-apple-darwin
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-arm64
-          path: target/aarch64-apple-darwin/release/
+作者：开心每一天1111
+链接：https://www.imooc.com/article/362195
+来源：慕课网
+本文原创发布于慕课网 ，转载请注明出处，谢谢合作
